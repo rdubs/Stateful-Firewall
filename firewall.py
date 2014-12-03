@@ -1,14 +1,13 @@
 #!/usr/bin/env python
 
 from main import PKT_DIR_INCOMING, PKT_DIR_OUTGOING
-import socket, struct
+import socket, struct, random
 
 # TODO: Feel free to import any Python standard moduless as necessary.
 # (http://docs.python.org/2/library/)
 # You must NOT use any 3rd-party libraries, though.
 
 class Firewall:
-    ICMP = 1
     TCP = 6
     UDP = 17
     def __init__(self, config, iface_int, iface_ext):
@@ -22,6 +21,8 @@ class Firewall:
             if line[0] != '%' and line != '\n':
                 line = line.replace('\n', '')
                 line = line.split()
+                line[1] = line[1].lower()
+                line[0] = line[0].lower()
                 self.rules.append(tuple(line)) # line has format: (<verdict>, <protocol>, <external IP address>, <external port>) 
                                                # or (<verdict>, dns, <domain name>)
                                                #or (log, http, <host name>)
@@ -39,21 +40,18 @@ class Firewall:
         
         if pkt_dir == PKT_DIR_OUTGOING:
             external_ip = ip_header[16: 20]
-            external_port = struct.unpack('!H', transport_header[2:4])[0]
+            external_port_in_bytes = transport_header[2:4]
+            external_port = struct.unpack('!H', external_port_in_bytes)[0]
         #packet is incoming
         else:
             external_ip = ip_header[12:16] # initialize external_ip to source ip (where packet came from)
-            external_port = struct.unpack('!H', transport_header[0:2])[0]
+            external_port_in_bytes = transport_header[0:2]
+            external_port = struct.unpack('!H', external_port_in_bytes)[0]
 
         try:
             external_ip = socket.inet_ntoa(external_ip) #go from bytes to ip string
         except socket.error:
             return
-        
-        #an ICMP packet does not have an external_port.
-        if protocol == Firewall.ICMP:
-            #this is not actually a port, but the type of icmp request.
-            external_port = struct.unpack('!B',transport_header[0:1])
 
         #figure out what type of packet we have.
         is_dns_packet = False
@@ -66,7 +64,7 @@ class Firewall:
             if qd_count > 1:
                 return
             dns_question = dns_header[12:] #question portion of dns header
-            qname, qtype = self.get_domain_name(dns_question) #domain name (e.g. 'www.google.com')
+            domain, qtype = self.get_domain_name(dns_question) #domain name (e.g. 'www.google.com')
             
             # only consider packets with proper qtype (1 or 28) for dns rule matches
             if qtype not in (1,28):
@@ -75,24 +73,85 @@ class Firewall:
         #handle packet rule matching.
         curr_match = None
         for rule in self.rules:
-            #we have a Protocol/IP/Port Rule. These rules can be applied to all packets.
-            if len(rule) == 4:
-                if self.protocol_matches(protocol, rule[1].lower()) and self.external_ip_matches(external_ip, rule[2].lower()) and self.external_port_matches(external_port, rule[3]):
-                    curr_match = rule
-            # we have DNS rule
-            else:
-                #only check DNS rules if packet is a dns packet
-                if is_dns_packet and self.domain_matches(qname, rule[2].lower()):
-                    curr_match = rule
+            #we have a deny tcp rule 
+            if rule[1] == 'tcp' and self.external_ip_matches(external_ip, rule[2].lower()) and self.external_port_matches(external_port, rule[3]):
+                # print('matched ip: ' + external_ip)
+                curr_match = rule
+            #only check DNS rules if packet is a dns packet
+            elif is_dns_packet and rule[1].lower() == 'dns' and self.domain_matches(domain, rule[2].lower()):
+                curr_match = rule
         
-        #send packet only if the last rule it matched says to let it pass
-        if curr_match == None or curr_match[0] == 'pass':
+        #send packet if it does not match any rules.
+        if curr_match == None:
             if pkt_dir == PKT_DIR_INCOMING:
                 self.iface_int.send_ip_packet(pkt)
             elif pkt_dir == PKT_DIR_OUTGOING:
                 self.iface_ext.send_ip_packet(pkt)
+        else:
+            if curr_match[1] == 'tcp':
+                #add ip header
+                new_pkt = struct.pack('!B', 69) #version_plus_hlen
+                new_pkt += struct.pack('!B', 0) #tos 
+                new_pkt += struct.pack('!H', 40) #total_len
+                new_pkt += struct.pack('!L', 0) #identification_plus_offset
+                new_pkt += struct.pack('!B', 3) #ttl
+                
+                #flag is this always tcp?
+                new_pkt += struct.pack('!B', 6) #protocol
+                dummy = new_pkt
+                dummy += struct.pack('!H', 0) #empty checksum
+                (external_ip)
+                # print('source ip' + socket.inet_ntoa(pkt[16:20]))
+                # print('destination ip' + socket.inet_ntoa(pkt[12:16]))
+                dummy += pkt[16:20] #source
+                dummy += pkt[12:16] #destination
+                ip_checksum = self.gen_checksum(dummy)
+                new_pkt += struct.pack('!H', ip_checksum) #checksum for actual packet
+                new_pkt += pkt[16:20] #source for actual
+                new_pkt += pkt[12:16] #destination for actual
+
+                #add transport header
+                new_pkt += transport_header[2:4] #source port
+                new_pkt += transport_header[0:2] #destination port
+                new_pkt += struct.pack('!L', random.randrange(0,10)) #seq number
+                seq_num = struct.unpack('!L', transport_header[4:8])[0]
+                new_pkt += struct.pack('!L', seq_num + 1) #ack num
+                new_pkt += struct.pack('!B', 0) #offset + reserved fields   
+
+                #set rst and ack flags
+                new_pkt += struct.pack('!B', 20)
+
+                new_pkt += struct.pack('!H', 0) #window
+                dummy = new_pkt
+                dummy += struct.pack('!H', 0) #checksum
+                dummy += struct.pack('!H', 0) #urgent pointer
+                tcp_checksum = self.gen_checksum(dummy[20:]) # pass 20 byte transport header
+                new_pkt += struct.pack('!H', tcp_checksum) # tcp checksum for actual packet
+                new_pkt += struct.pack('!H', 0) #urgent pointer for actual packet
+
+                self.iface_int.send_ip_packet(new_pkt)
+            # elif is_dns_packet and rule[1].lower() == 'dns' and self.domain_matches(domain, rule[2]):
+            #     if qtype == 28:
+            #         return
+
+
+
+
 
     # TODO: You can add more methods as you want.
+    def gen_checksum(self, header):
+        summ = 0
+        for i in range(0,10):
+            summ += struct.unpack('!H', header[0:2])[0]
+            header = header[2:]
+        summ_to_binstring = bin(summ).replace('0b', '')
+        if len(summ_to_binstring) > 16:
+            diff = len(summ_to_binstring) - 16
+            partial_sum = summ_to_binstring[diff:] #get main 16bits
+            carry = summ_to_binstring[0: diff + 1]
+            summ = int(partial_sum, 2) + int(carry, 2)
+        return summ ^ 0xffff
+
     def protocol_matches(self, packet_prot, rule_prot):
         if rule_prot == 'any':
             return True
