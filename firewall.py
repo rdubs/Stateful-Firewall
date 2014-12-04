@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 from main import PKT_DIR_INCOMING, PKT_DIR_OUTGOING
+from ctypes import *
 import socket, struct, random
 
 # TODO: Feel free to import any Python standard moduless as necessary.
@@ -32,7 +33,7 @@ class Firewall:
     def handle_packet(self, pkt_dir, pkt):
         header_len = (ord(pkt[0:1]) & 0x0f) * 4
         #drop packet if header length is < 5 (spec)
-        if header_len < 5:
+        if header_len < 20:
             return
         ip_header = pkt[0: header_len]
         transport_header = pkt[header_len:]
@@ -64,7 +65,7 @@ class Firewall:
             if qd_count > 1:
                 return
             dns_question = dns_header[12:] #question portion of dns header
-            domain, qtype = self.get_domain_name(dns_question) #domain name (e.g. 'www.google.com')
+            domain, qtype, qname_bytes = self.get_domain_name(dns_question) #domain name (e.g. 'www.google.com')
             
             # only consider packets with proper qtype (1 or 28) for dns rule matches
             if qtype not in (1,28):
@@ -80,6 +81,7 @@ class Firewall:
             #only check DNS rules if packet is a dns packet
             elif is_dns_packet and rule[1].lower() == 'dns' and self.domain_matches(domain, rule[2].lower()):
                 curr_match = rule
+                print('dns rule matched')
         
         #send packet if it does not match any rules.
         if curr_match == None:
@@ -89,50 +91,112 @@ class Firewall:
                 self.iface_ext.send_ip_packet(pkt)
         else:
             if curr_match[1] == 'tcp':
-                #add ip header
-                new_pkt = struct.pack('!B', 69) #version_plus_hlen
-                new_pkt += struct.pack('!B', 0) #tos 
-                new_pkt += struct.pack('!H', 40) #total_len
-                new_pkt += struct.pack('!L', 0) #identification_plus_offset
-                new_pkt += struct.pack('!B', 3) #ttl
+                source_ip = pkt[16:20]
+                dest_ip = pkt[12:16]
+                dummy_pkt = create_string_buffer(20)
+                struct.pack_into('!BBHLBBHLL', dummy_pkt, 0, 69, 0, 40, 0, 64, 6, 0, struct.unpack('!L', source_ip)[0], struct.unpack('!L', dest_ip)[0])
+                ip_checksum = self.gen_checksum(dummy_pkt.raw)
+                new_pkt = create_string_buffer(20)
+                struct.pack_into('!BBHLBBHLL', new_pkt, 0, 69, 0, 40, 0, 64, 6, ip_checksum, struct.unpack('!L', source_ip)[0], struct.unpack('!L', dest_ip)[0])
+                new_pkt = new_pkt.raw
                 
-                #flag is this always tcp?
-                new_pkt += struct.pack('!B', 6) #protocol
-                dummy = new_pkt
-                dummy += struct.pack('!H', 0) #empty checksum
-                (external_ip)
-                # print('source ip' + socket.inet_ntoa(pkt[16:20]))
-                # print('destination ip' + socket.inet_ntoa(pkt[12:16]))
-                dummy += pkt[16:20] #source
-                dummy += pkt[12:16] #destination
-                ip_checksum = self.gen_checksum(dummy)
-                new_pkt += struct.pack('!H', ip_checksum) #checksum for actual packet
-                new_pkt += pkt[16:20] #source for actual
-                new_pkt += pkt[12:16] #destination for actual
-
                 #add transport header
-                new_pkt += transport_header[2:4] #source port
-                new_pkt += transport_header[0:2] #destination port
-                new_pkt += struct.pack('!L', random.randrange(0,10)) #seq number
+                tcp_header = ''
+                tcp_header += transport_header[2:4] #source port
+                tcp_header += transport_header[0:2] #destination port
+                tcp_header += struct.pack('!L', 0) #seq number--irrelevant
                 seq_num = struct.unpack('!L', transport_header[4:8])[0]
-                new_pkt += struct.pack('!L', seq_num + 1) #ack num
-                new_pkt += struct.pack('!B', 0) #offset + reserved fields   
+                tcp_header += struct.pack('!L', seq_num + 1) #ack num
+                
+                tcp_header += struct.pack('!B', 80) #offset + reserved fields
 
                 #set rst and ack flags
-                new_pkt += struct.pack('!B', 20)
+                tcp_header += struct.pack('!B', 20)
 
-                new_pkt += struct.pack('!H', 0) #window
-                dummy = new_pkt
-                dummy += struct.pack('!H', 0) #checksum
-                dummy += struct.pack('!H', 0) #urgent pointer
-                tcp_checksum = self.gen_checksum(dummy[20:]) # pass 20 byte transport header
+                tcp_header += struct.pack('!H', 0) #window
+                dummy_tcp_header = tcp_header + struct.pack('!H', 0) #add empty checksum
+                dummy_tcp_header += struct.pack('!H', 0) #urgent pointer
+                tcp_pseudo_header = source_ip + dest_ip + struct.pack('!B', 0) + struct.pack('!B', 6) + struct.pack('!H', 20)
+                tcp_checksum = self.gen_checksum(tcp_pseudo_header + dummy_tcp_header)
+
+                new_pkt += tcp_header
                 new_pkt += struct.pack('!H', tcp_checksum) # tcp checksum for actual packet
                 new_pkt += struct.pack('!H', 0) #urgent pointer for actual packet
 
                 self.iface_int.send_ip_packet(new_pkt)
-            # elif is_dns_packet and rule[1].lower() == 'dns' and self.domain_matches(domain, rule[2]):
-            #     if qtype == 28:
-            #         return
+            elif curr_match[1].lower() == 'dns':
+                if qtype == 28:
+                    return
+                #construct dns response packet
+                #dns header
+                dns_id = dns_header[0:2]
+                b4_rcode = 128
+                rcode = struct.unpack('!B', dns_header[3:4])[0] & 0xf
+                qr_plus_rcode = struct.pack('!B', b4_rcode) + struct.pack('!B', rcode)
+                qdcount = struct.pack('!H', 1)
+                ancount = struct.pack('!H', 1)
+                nscount = struct.pack('!H', 0)
+                arcount = struct.pack('!H', 0)
+                question = dns_header[12:] #FLAG is this okay
+                dns_header = dns_id + qr_plus_rcode + qdcount + ancount + nscount + arcount + question
+
+                #answer 
+                name = qname_bytes
+                ans_type = struct.pack('!H', 1) #A = 1
+                ans_class = struct.pack('!H', 1)
+                ans_ttl = struct.pack('!L', 1)
+                rdlength = struct.pack('!H', 4) #FLAG
+                rdata = struct.pack('!L', 917364886)
+                dns_answer = name + ans_type + ans_class + ans_ttl + rdlength + rdata
+
+                #add anwser to dns_header
+                dns_header = dns_header + dns_answer
+                dns_header_len = len(dns_header)
+
+                #ip header
+                dummy_ip_header = create_string_buffer(20)
+                #version_plus_hlen = 69, tos, total_len, iden_plus_frag, ttl, prot, ip_checksum, source, destination 
+                #FLAG might need < here
+                struct.pack_into('!BBHLBBHLL', dummy_ip_header, 0, 69, 0, 28 + dns_header_len, 0, 64, 17, 0, struct.unpack('!L', pkt[16:20])[0], struct.unpack('!L', pkt[12:16])[0])
+                ip_checksum = self.gen_checksum(dummy_ip_header.raw)
+                ip_header = create_string_buffer(20)
+                struct.pack_into('!BBHLBBHLL', ip_header, 0, 69, 0, 28 + dns_header_len, 0, 64, 17, ip_checksum, struct.unpack('!L', pkt[16:20])[0], struct.unpack('!L', pkt[12:16])[0])
+
+                #udp header
+                source_port = transport_header[2:4]
+                dest_port = transport_header[0:2]
+                udp_len = struct.pack('!H', 8 + dns_header_len)
+                udp_checksum = struct.pack('!H', 0)
+
+                udp_pseudo_header = pkt[16:20] + pkt[12:16] + struct.pack('!B', 0) + struct.pack('!B', 17) + struct.pack('!H', 8 + dns_header_len)
+                udp_dummy_header = udp_pseudo_header + source_port + dest_port + udp_len + udp_checksum
+                udp_checksum = self.gen_checksum(udp_dummy_header)
+
+                udp_header = source_port + dest_port + udp_len + struct.pack('!H', udp_checksum)
+
+                dns_response_pkt = ip_header.raw + udp_header + dns_header
+
+                self.iface_int.send_ip_packet(dns_response_pkt)
+
+
+
+
+
+
+                
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -141,14 +205,14 @@ class Firewall:
     # TODO: You can add more methods as you want.
     def gen_checksum(self, header):
         summ = 0
-        for i in range(0,10):
+        for i in range(0,len(header) / 2):
             summ += struct.unpack('!H', header[0:2])[0]
             header = header[2:]
         summ_to_binstring = bin(summ).replace('0b', '')
         if len(summ_to_binstring) > 16:
             diff = len(summ_to_binstring) - 16
             partial_sum = summ_to_binstring[diff:] #get main 16bits
-            carry = summ_to_binstring[0: diff + 1]
+            carry = summ_to_binstring[0: diff]
             summ = int(partial_sum, 2) + int(carry, 2)
         return summ ^ 0xffff
 
@@ -212,18 +276,26 @@ class Firewall:
 
     @staticmethod
     def get_domain_name(qname):
-        length_byte = struct.unpack('!b', qname[0:1])[0]
+        bytes_read = ''
+        bytes_read += qname[0:1]
+        length_byte = struct.unpack('!B', qname[0:1])[0]
         curr_byte = 1
         domain_str = ''
+        # print('qname len: ' + str(len(qname)))
         while length_byte != 0:
             for i in range(0, length_byte):
+                bytes_read += qname[curr_byte: (curr_byte + 1)]
                 domain_str += chr(struct.unpack('!B', qname[curr_byte:(curr_byte + 1)])[0])
                 curr_byte += 1
             domain_str += '.'
-            length_byte = struct.unpack('!b', qname[curr_byte:(curr_byte + 1)])[0]
+            # print(domain_str)
+            bytes_read += qname[curr_byte: (curr_byte + 1)]
+            length_byte = struct.unpack('!B', qname[curr_byte:(curr_byte + 1)])[0]
             curr_byte += 1
         domain_str = domain_str[0:-1] #get rid of extra '.' at end
-        return domain_str, struct.unpack('!H', qname[curr_byte: curr_byte + 2])[0]
+        # print('domain str: ' + domain_str)
+        # print('bytes read: ' + bytes_read + ' vs. allbytes: ' + qname)
+        return domain_str, struct.unpack('!H', qname[curr_byte: curr_byte + 2])[0], bytes_read
 
     @staticmethod
     def ip2long(ip):
