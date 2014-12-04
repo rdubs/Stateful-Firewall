@@ -192,8 +192,14 @@ class Firewall:
             # initialize empty Request + Response strings
             http_connections[(external_ip, dest_port)] = ["", 0, "", 0]
 
+### initialize Seq #s, based on first pkt // seq # transport_header[4:8]
+        
+        # map {(external IP, internal port) : ["request", request_seqno, "response", response_seqno]}
+        request = http_connections[(external_ip, dest_port)][0]
+        response = http_connections[(external_ip, dest_port)][2]
+        
         # assemble entire request + response
-        while "\r\n\r\n" not in request or "\r\n\r\n" not in response:
+        if "\r\n\r\n" not in request or "\r\n\r\n" not in response:
             # (fun fact) content length === pkt size - IP - TCP
             #\r\n\r\n (4bytes) as end of header (only on last pkt of header)
             if pkt_dir == PKT_DIR_OUTGOING : #request
