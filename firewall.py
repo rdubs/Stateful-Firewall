@@ -11,6 +11,8 @@ import socket, struct, random
 class Firewall:
     TCP = 6
     UDP = 17
+    # map {(external IP, internal port) : ["request", request_seqno, "response", response_seqno]}
+    http_connections = {}
     def __init__(self, config, iface_int, iface_ext):
         self.iface_int = iface_int
         self.iface_ext = iface_ext
@@ -177,8 +179,49 @@ class Firewall:
                 dns_response_pkt = ip_header.raw + udp_header + dns_header
 
                 self.iface_int.send_ip_packet(dns_response_pkt)
+                
+    # 3) Log HTTP
+    def log_http(self, pkt, external_ip):        
+        header_len = (ord(pkt[0:1]) & 0x0f) * 4
+        transport_header = pkt[header_len:]
+        transport_len = (ord(transport_header[12:13]) & 0xf0) * 4
+        payload = pkt[header_len + transport_len:]
 
+        if not external_ip in http_connections:
+            # initialize empty Request + Response strings
+            http_connections[external_ip] = ["", 0, "", 0]
 
+        # assemble entire request + response
+        while "\r\n\r\n" not in request or "\r\n\r\n" not in response:
+            # (fun fact) content length === pkt size - IP - TCP
+            #\r\n\r\n (4bytes) as end of header (only on last pkt of header)
+            if pkt_dir == PKT_DIR_OUTGOING : #request
+                stream = http_connections[external_ip][0]
+                curr_seqno = http_connections[external_ip][1]
+            else: #response
+                stream = http_connections[external_ip][3]
+                curr_seqno = http_connections[external_ip][4]
+
+            if transport_header[4:8] <= curr_seqno:
+                stream += assemble_http(self, pkt, curr_seqno, payload) # add http payload to request / response
+                curr_seqno += len(payload) # increment sequence num
+        
+        # now, extract relevant data
+        host_name = None
+        method = request.split()[0]
+        path = request.split()[1]
+        version = request.split()[2]
+        status_code = response.split()[1]
+        if "Content-Length" in response:
+            esponse.find("Content-Length")
+            object_size = #FIX
+        bytestream = host_name + " " + method + " " + path + " " + version + " " + status_code + " " + object_size
+        # should i add a '\n', or will ".write()" do it for me?
+
+        # write to log
+        f = open('http.log', a)
+        f.write(bytestream)?? # fix syntax
+        f.flush()
 
 
 
