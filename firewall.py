@@ -179,7 +179,7 @@ class Firewall:
                 dns_response_pkt = ip_header.raw + udp_header + dns_header
 
                 self.iface_int.send_ip_packet(dns_response_pkt)
-                
+
     # 3) Log HTTP
     def log_http(self, pkt, external_ip):        
         header_len = (ord(pkt[0:1]) & 0x0f) * 4
@@ -310,6 +310,8 @@ class Firewall:
         if rule_domain == "*":
             return True
         elif rule_domain[0] == "*":
+            if len(domain) < len(rule_domain[1:]):
+                return false
             for i in range(1, len(rule_domain)):
                 if rule_domain[-i] != domain[-i]:
                     return False
