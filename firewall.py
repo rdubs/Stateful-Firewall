@@ -243,7 +243,10 @@ class Firewall:
                 stream = 2
                 curr_seqno = 3
             packet_seq = struct.unpack('!L', transport_header[4:8])[0]
-            if packet_seq > self.http_connections[(external_ip, dest_port)][curr_seqno]:
+            if self.http_connections[(external_ip, dest_port)][3] == None:
+                return
+            if ((self.http_connections[(external_ip, dest_port)][curr_seqno] - packet_seq) % 0xFFFFFFFF) < 0xFFFFFFF:
+            #if packet_seq > self.http_connections[(external_ip, dest_port)][curr_seqno]:
                 # print('packet_seq ' + str(packet_seq))
                 # print('expected seq: ' + str(self.http_connections[(external_ip, dest_port)][curr_seqno]))
                 # print('returning')
