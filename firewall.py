@@ -189,7 +189,7 @@ class Firewall:
     def handle_http(self, pkt, external_ip, pkt_dir):
         header_len = (ord(pkt[0:1]) & 0x0f) * 4
         transport_header = pkt[header_len:]
-        transport_len = (ord(transport_header[12:13]) & 0xf0) * 4
+        transport_len = 20
         payload = pkt[header_len + transport_len:]
         dest_port = struct.unpack('!H', transport_header[0:2])[0]
         if pkt_dir == PKT_DIR_INCOMING:
@@ -200,12 +200,16 @@ class Firewall:
         # print(str(struct.unpack('!H', transport_header[2:4])[0]))
         # print(str((external_ip, dest_port)))
         
-        print(str(dest_port))
-        if self.is_syn(transport_header) and (external_ip, dest_port) not in self.http_connections:
+        if  (external_ip, dest_port) not in self.http_connections:
             initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
-            self.http_connections[(external_ip, dest_port)] = ["", initial_seq_num, "", None]
+            self.http_connections[(external_ip, dest_port)] = ["", initial_seq_num + 1, "", None]
+            # print('adding entry due to syn bit: ' + str((external_ip, dest_port)))
         elif self.is_syn(transport_header) and self.is_ack(transport_header):
-            self.http_connections[(external_ip, dest_port)][3] = struct.unpack('!L', transport_header[4:8])[0]
+            self.http_connections[(external_ip, dest_port)][3] = struct.unpack('!L', transport_header[4:8])[0] + 1
+        #tear down connection on fin ack
+        # elif self.is_fin(transport_header) and self.is_ack(transport_header):
+        #     del self.http_connections[(external_ip, dest_port)]
+
 
 
         # if pkt_dir == PKT_DIR_INCOMING:
@@ -228,13 +232,10 @@ class Firewall:
 
         request = self.http_connections[(external_ip, dest_port)][0]
         response = self.http_connections[(external_ip, dest_port)][2]
-        print('request: ' + request)
-        print('response: ' + response)
         # assemble entire request + response
         if "\r\n\r\n" not in request or "\r\n\r\n" not in response:
             # (fun fact) content length === pkt size - IP - TCP
             #\r\n\r\n (4bytes) as end of header (only on last pkt of header)
-            print('entering blah')
             if pkt_dir == PKT_DIR_OUTGOING : #request
                 stream = 0
                 curr_seqno = 1
@@ -243,12 +244,14 @@ class Firewall:
                 curr_seqno = 3
             packet_seq = struct.unpack('!L', transport_header[4:8])[0]
             if packet_seq > self.http_connections[(external_ip, dest_port)][curr_seqno]:
-                print('packet_seq ' + str(packet_seq))
-                print('expected seq: ' + str(self.http_connections[(external_ip, dest_port)][curr_seqno]))
-                print('returning')
+                # print('packet_seq ' + str(packet_seq))
+                # print('expected seq: ' + str(self.http_connections[(external_ip, dest_port)][curr_seqno]))
+                # print('returning')
                 return
             elif packet_seq  == self.http_connections[(external_ip, dest_port)][curr_seqno]:
-                print('seq = expected')
+                # print('seq = expected')
+                # print('adding payload: ' + payload)
+                # print('len of payload: ') + str(len(payload))
                 self.http_connections[(external_ip, dest_port)][stream] += payload # add http payload to request / response
                 self.http_connections[(external_ip, dest_port)][curr_seqno] += len(payload) # increment sequence num
             #send packet through
@@ -263,15 +266,16 @@ class Firewall:
     def is_syn(self, transport_header):
         flags = struct.unpack('!B', transport_header[13:14])[0]
         #00000010
-        print(flags & 0x2 > 0)
         return flags & 0x2 > 0
-
 
     def is_ack(self, transport_header):
         flags = struct.unpack('!B', transport_header[13:14])[0]
         #00010000
-        print(flags & 0x10 > 0)
         return flags & 0x10 > 0
+
+    def is_fin(self, transport_header):
+        flags = struct.unpack('!B', transport_header[13:14])[0]
+        return flags & 0x1 > 0
 
 
     # 3) Log HTTP        
@@ -279,11 +283,17 @@ class Firewall:
         # now, extract relevant data
         request = self.http_connections[(external_ip, dest_port)][0]
         response = self.http_connections[(external_ip, dest_port)][2]
-        request_lines = request.split('\n')
-        response_lines = response.split('\n')
+        request_lines = request.split('\r\n')
+        response_lines = response.split('\r\n')
 
         contains_host = False
+        print("Request lines: ")
+        print(request_lines)
+        #print("Response lines: ")
+        #print(response_lines)
         for line in range(0, len(request_lines)):
+            if len(request_lines[line].split()) < 2:
+                continue
             if request_lines[line].split()[0].lower() == "host:":
                 host_name = request_lines[line].split()[1].lower()
                 contains_host = True
@@ -306,20 +316,23 @@ class Firewall:
         
         contains_CL = False
         for line in range(0, len(response_lines)):
+            if len(response_lines[line].split()) < 2:
+                continue
             if response_lines[line].split()[0].lower() == "content-length:":
                 object_size = response_lines[line].split()[1]
                 contains_CL = True
         if not contains_CL:
-            object_size = -1
+            object_size = "-1"
 
-        bytestream = host_name + " " + method + " " + path + " " + version + " " + status_code + " " + object_size
+        bytestream = host_name + " " + method + " " + path + " " + version + " " + status_code + " " + object_size + "\n"
         #FLAG should i add a '\n', or will ".write()" do it for me?
-
         # write to log
-        print('writing to log')
-        f = open('http.log', a)
+        f = open('http.log', 'a')
         f.write(bytestream) # fix syntax
         f.flush()
+        self.http_connections[(external_ip, dest_port)][0] = ''
+        self.http_connections[(external_ip, dest_port)][2] = ''
+        return
 
 
 
