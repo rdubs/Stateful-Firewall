@@ -29,6 +29,7 @@ class Firewall:
                 self.rules.append(tuple(line)) # line has format: (<verdict>, <protocol>, <external IP address>, <external port>) 
                                                # or (<verdict>, dns, <domain name>)
                                                #or (log, http, <host name>)
+        self.http_connections = {}
 
     # @pkt_dir: either PKT_DIR_INCOMING or PKT_DIR_OUTGOING
     # @pkt: the actual data of the IPv4 packet (including IP header)
@@ -78,158 +79,246 @@ class Firewall:
         for rule in self.rules:
             #we have a deny tcp rule 
             if rule[1] == 'tcp' and self.external_ip_matches(external_ip, rule[2].lower()) and self.external_port_matches(external_port, rule[3]):
-                # print('matched ip: ' + external_ip)
                 curr_match = rule
             #only check DNS rules if packet is a dns packet
             elif is_dns_packet and rule[1].lower() == 'dns' and self.domain_matches(domain, rule[2].lower()):
                 curr_match = rule
-                print('dns rule matched')
-        
-        #send packet if it does not match any rules.
-        if curr_match == None:
+        #send packet if it does not match any deny rules.
+        if curr_match == None and protocol != Firewall.TCP and external_port != 80:
             if pkt_dir == PKT_DIR_INCOMING:
                 self.iface_int.send_ip_packet(pkt)
             elif pkt_dir == PKT_DIR_OUTGOING:
                 self.iface_ext.send_ip_packet(pkt)
-        else:
-            if curr_match[1] == 'tcp':
-                source_ip = pkt[16:20]
-                dest_ip = pkt[12:16]
-                dummy_pkt = create_string_buffer(20)
-                struct.pack_into('!BBHLBBHLL', dummy_pkt, 0, 69, 0, 40, 0, 64, 6, 0, struct.unpack('!L', source_ip)[0], struct.unpack('!L', dest_ip)[0])
-                ip_checksum = self.gen_checksum(dummy_pkt.raw)
-                new_pkt = create_string_buffer(20)
-                struct.pack_into('!BBHLBBHLL', new_pkt, 0, 69, 0, 40, 0, 64, 6, ip_checksum, struct.unpack('!L', source_ip)[0], struct.unpack('!L', dest_ip)[0])
-                new_pkt = new_pkt.raw
-                
-                #add transport header
-                tcp_header = ''
-                tcp_header += transport_header[2:4] #source port
-                tcp_header += transport_header[0:2] #destination port
-                tcp_header += struct.pack('!L', 0) #seq number--irrelevant
-                seq_num = struct.unpack('!L', transport_header[4:8])[0]
-                tcp_header += struct.pack('!L', seq_num + 1) #ack num
-                
-                tcp_header += struct.pack('!B', 80) #offset + reserved fields
+            return
 
-                #set rst and ack flags
-                tcp_header += struct.pack('!B', 20)
+        #make sure curr_match exists
+        elif curr_match and curr_match[1].lower() == 'tcp':
+            source_ip = pkt[16:20]
+            dest_ip = pkt[12:16]
+            dummy_pkt = create_string_buffer(20)
+            struct.pack_into('!BBHLBBHLL', dummy_pkt, 0, 69, 0, 40, 0, 64, 6, 0, struct.unpack('!L', source_ip)[0], struct.unpack('!L', dest_ip)[0])
+            ip_checksum = self.gen_checksum(dummy_pkt.raw)
+            new_pkt = create_string_buffer(20)
+            struct.pack_into('!BBHLBBHLL', new_pkt, 0, 69, 0, 40, 0, 64, 6, ip_checksum, struct.unpack('!L', source_ip)[0], struct.unpack('!L', dest_ip)[0])
+            new_pkt = new_pkt.raw
+            
+            #add transport header
+            tcp_header = ''
+            tcp_header += transport_header[2:4] #source port
+            tcp_header += transport_header[0:2] #destination port
+            tcp_header += struct.pack('!L', 0) #seq number--irrelevant
+            seq_num = struct.unpack('!L', transport_header[4:8])[0]
+            tcp_header += struct.pack('!L', seq_num + 1) #ack num
+            
+            tcp_header += struct.pack('!B', 80) #offset + reserved fields
 
-                tcp_header += struct.pack('!H', 0) #window
-                dummy_tcp_header = tcp_header + struct.pack('!H', 0) #add empty checksum
-                dummy_tcp_header += struct.pack('!H', 0) #urgent pointer
-                tcp_pseudo_header = source_ip + dest_ip + struct.pack('!B', 0) + struct.pack('!B', 6) + struct.pack('!H', 20)
-                tcp_checksum = self.gen_checksum(tcp_pseudo_header + dummy_tcp_header)
+            #set rst and ack flags
+            tcp_header += struct.pack('!B', 20)
 
-                new_pkt += tcp_header
-                new_pkt += struct.pack('!H', tcp_checksum) # tcp checksum for actual packet
-                new_pkt += struct.pack('!H', 0) #urgent pointer for actual packet
+            tcp_header += struct.pack('!H', 0) #window
+            dummy_tcp_header = tcp_header + struct.pack('!H', 0) #add empty checksum
+            dummy_tcp_header += struct.pack('!H', 0) #urgent pointer
+            tcp_pseudo_header = source_ip + dest_ip + struct.pack('!B', 0) + struct.pack('!B', 6) + struct.pack('!H', 20)
+            tcp_checksum = self.gen_checksum(tcp_pseudo_header + dummy_tcp_header)
 
-                self.iface_int.send_ip_packet(new_pkt)
-            elif curr_match[1].lower() == 'dns':
-                if qtype == 28:
-                    return
-                #construct dns response packet
-                #dns header
-                dns_id = dns_header[0:2]
-                b4_rcode = 128
-                rcode = struct.unpack('!B', dns_header[3:4])[0] & 0xf
-                qr_plus_rcode = struct.pack('!B', b4_rcode) + struct.pack('!B', rcode)
-                qdcount = struct.pack('!H', 1)
-                ancount = struct.pack('!H', 1)
-                nscount = struct.pack('!H', 0)
-                arcount = struct.pack('!H', 0)
-                question = dns_header[12:] #FLAG is this okay
-                dns_header = dns_id + qr_plus_rcode + qdcount + ancount + nscount + arcount + question
+            new_pkt += tcp_header
+            new_pkt += struct.pack('!H', tcp_checksum) # tcp checksum for actual packet
+            new_pkt += struct.pack('!H', 0) #urgent pointer for actual packet
 
-                #answer 
-                name = qname_bytes
-                ans_type = struct.pack('!H', 1) #A = 1
-                ans_class = struct.pack('!H', 1)
-                ans_ttl = struct.pack('!L', 1)
-                rdlength = struct.pack('!H', 4) #FLAG
-                rdata = struct.pack('!L', 917364886)
-                dns_answer = name + ans_type + ans_class + ans_ttl + rdlength + rdata
+            self.iface_int.send_ip_packet(new_pkt)
+            return
+        elif curr_match and curr_match[1].lower() == 'dns':
+            if qtype == 28:
+                return
+            #construct dns response packet
+            #dns header
+            dns_id = dns_header[0:2]
+            b4_rcode = 128
+            rcode = struct.unpack('!B', dns_header[3:4])[0] & 0xf
+            qr_plus_rcode = struct.pack('!B', b4_rcode) + struct.pack('!B', rcode)
+            qdcount = struct.pack('!H', 1)
+            ancount = struct.pack('!H', 1)
+            nscount = struct.pack('!H', 0)
+            arcount = struct.pack('!H', 0)
+            question = dns_header[12:] #FLAG is this okay
+            dns_header = dns_id + qr_plus_rcode + qdcount + ancount + nscount + arcount + question
 
-                #add anwser to dns_header
-                dns_header = dns_header + dns_answer
-                dns_header_len = len(dns_header)
+            #answer 
+            name = qname_bytes
+            ans_type = struct.pack('!H', 1) #A = 1
+            ans_class = struct.pack('!H', 1)
+            ans_ttl = struct.pack('!L', 1)
+            rdlength = struct.pack('!H', 4) #FLAG
+            rdata = struct.pack('!L', 917364886)
+            dns_answer = name + ans_type + ans_class + ans_ttl + rdlength + rdata
 
-                #ip header
-                dummy_ip_header = create_string_buffer(20)
-                #version_plus_hlen = 69, tos, total_len, iden_plus_frag, ttl, prot, ip_checksum, source, destination 
-                #FLAG might need < here
-                struct.pack_into('!BBHLBBHLL', dummy_ip_header, 0, 69, 0, 28 + dns_header_len, 0, 64, 17, 0, struct.unpack('!L', pkt[16:20])[0], struct.unpack('!L', pkt[12:16])[0])
-                ip_checksum = self.gen_checksum(dummy_ip_header.raw)
-                ip_header = create_string_buffer(20)
-                struct.pack_into('!BBHLBBHLL', ip_header, 0, 69, 0, 28 + dns_header_len, 0, 64, 17, ip_checksum, struct.unpack('!L', pkt[16:20])[0], struct.unpack('!L', pkt[12:16])[0])
+            #add anwser to dns_header
+            dns_header = dns_header + dns_answer
+            dns_header_len = len(dns_header)
 
-                #udp header
-                source_port = transport_header[2:4]
-                dest_port = transport_header[0:2]
-                udp_len = struct.pack('!H', 8 + dns_header_len)
-                udp_checksum = struct.pack('!H', 0)
+            #ip header
+            dummy_ip_header = create_string_buffer(20)
+            #version_plus_hlen = 69, tos, total_len, iden_plus_frag, ttl, prot, ip_checksum, source, destination 
+            #FLAG might need < here
+            struct.pack_into('!BBHLBBHLL', dummy_ip_header, 0, 69, 0, 28 + dns_header_len, 0, 64, 17, 0, struct.unpack('!L', pkt[16:20])[0], struct.unpack('!L', pkt[12:16])[0])
+            ip_checksum = self.gen_checksum(dummy_ip_header.raw)
+            ip_header = create_string_buffer(20)
+            struct.pack_into('!BBHLBBHLL', ip_header, 0, 69, 0, 28 + dns_header_len, 0, 64, 17, ip_checksum, struct.unpack('!L', pkt[16:20])[0], struct.unpack('!L', pkt[12:16])[0])
 
-                udp_pseudo_header = pkt[16:20] + pkt[12:16] + struct.pack('!B', 0) + struct.pack('!B', 17) + struct.pack('!H', 8 + dns_header_len)
-                udp_dummy_header = udp_pseudo_header + source_port + dest_port + udp_len + udp_checksum
-                udp_checksum = self.gen_checksum(udp_dummy_header)
+            #udp header
+            source_port = transport_header[2:4]
+            dest_port = transport_header[0:2]
+            udp_len = struct.pack('!H', 8 + dns_header_len)
+            udp_checksum = struct.pack('!H', 0)
 
-                udp_header = source_port + dest_port + udp_len + struct.pack('!H', udp_checksum)
+            udp_pseudo_header = pkt[16:20] + pkt[12:16] + struct.pack('!B', 0) + struct.pack('!B', 17) + struct.pack('!H', 8 + dns_header_len)
+            udp_dummy_header = udp_pseudo_header + source_port + dest_port + udp_len + udp_checksum
+            udp_checksum = self.gen_checksum(udp_dummy_header)
 
-                dns_response_pkt = ip_header.raw + udp_header + dns_header
+            udp_header = source_port + dest_port + udp_len + struct.pack('!H', udp_checksum)
 
-                self.iface_int.send_ip_packet(dns_response_pkt)
+            dns_response_pkt = ip_header.raw + udp_header + dns_header
+
+            self.iface_int.send_ip_packet(dns_response_pkt)
+            return
+        #check for http matches
+        elif protocol == Firewall.TCP and external_port == 80:
+            self.handle_http(pkt, external_ip, pkt_dir)
 
     # assemble responses / requests.
-    def assemble_http(self, pkt, external_ip, dest_port):
+    def handle_http(self, pkt, external_ip, pkt_dir):
         header_len = (ord(pkt[0:1]) & 0x0f) * 4
         transport_header = pkt[header_len:]
         transport_len = (ord(transport_header[12:13]) & 0xf0) * 4
-        payload = pkt[header_len + transport_len:]  
+        payload = pkt[header_len + transport_len:]
+        dest_port = struct.unpack('!H', transport_header[0:2])[0]
+        if pkt_dir == PKT_DIR_INCOMING:
+            dest_port = struct.unpack('!H', transport_header[2:4])[0]
+        # handle synAck
+        # print(self.http_connections)
+        # print(pkt_dir)
+        # print(str(struct.unpack('!H', transport_header[2:4])[0]))
+        # print(str((external_ip, dest_port)))
+        
+        print(str(dest_port))
+        if self.is_syn(transport_header) and (external_ip, dest_port) not in self.http_connections:
+            initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
+            self.http_connections[(external_ip, dest_port)] = ["", initial_seq_num, "", None]
+        elif self.is_syn(transport_header) and self.is_ack(transport_header):
+            self.http_connections[(external_ip, dest_port)][3] = struct.unpack('!L', transport_header[4:8])[0]
 
-        # if this is a new connection
-        if not (external_ip, dest_port) in http_connections:
-            # initialize empty Request + Response strings
-            http_connections[(external_ip, dest_port)] = ["", 0, "", 0]
 
-### initialize Seq #s, based on first pkt // seq # transport_header[4:8]
+        # if pkt_dir == PKT_DIR_INCOMING:
+        #     dest_port = struct.unpack('!H', transport_header[2:4])[0]
+        #     print(str(dest_port))
+        #     if self.http_connections[(external_ip, dest_port)][3] == None:
+        #         initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
+        #         self.http_connections[(external_ip, dest_port)][2]
+        # print(str((external_ip, dest_port)))
+        # # if this is a new connection
+        # if  pkt_dir == PKT_DIR_OUTGOING and (external_ip, dest_port) not in self.http_connections:
+        #     # initialize empty Request + Response strings
+        #     initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
+        #     self.http_connections[(external_ip, dest_port)] = ["", initial_seq_num, "", None]
+
+
+        ### initialize Seq #s, based on first pkt // seq # transport_header[4:8]
         
         # map {(external IP, internal port) : ["request", request_seqno, "response", response_seqno]}
-        request = http_connections[(external_ip, dest_port)][0]
-        response = http_connections[(external_ip, dest_port)][2]
-        
+
+        request = self.http_connections[(external_ip, dest_port)][0]
+        response = self.http_connections[(external_ip, dest_port)][2]
+        print('request: ' + request)
+        print('response: ' + response)
         # assemble entire request + response
         if "\r\n\r\n" not in request or "\r\n\r\n" not in response:
             # (fun fact) content length === pkt size - IP - TCP
             #\r\n\r\n (4bytes) as end of header (only on last pkt of header)
+            print('entering blah')
             if pkt_dir == PKT_DIR_OUTGOING : #request
-                stream = http_connections[(external_ip, dest_port)][0]
-                curr_seqno = http_connections[(external_ip, dest_port)][1]
+                stream = 0
+                curr_seqno = 1
             else: #response
-                stream = http_connections[(external_ip, dest_port)][3]
-                curr_seqno = http_connections[(external_ip, dest_port)][4]
+                stream = 2
+                curr_seqno = 3
+            packet_seq = struct.unpack('!L', transport_header[4:8])[0]
+            if packet_seq > self.http_connections[(external_ip, dest_port)][curr_seqno]:
+                print('packet_seq ' + str(packet_seq))
+                print('expected seq: ' + str(self.http_connections[(external_ip, dest_port)][curr_seqno]))
+                print('returning')
+                return
+            elif packet_seq  == self.http_connections[(external_ip, dest_port)][curr_seqno]:
+                print('seq = expected')
+                self.http_connections[(external_ip, dest_port)][stream] += payload # add http payload to request / response
+                self.http_connections[(external_ip, dest_port)][curr_seqno] += len(payload) # increment sequence num
+            #send packet through
+            if pkt_dir == PKT_DIR_INCOMING:
+                self.iface_int.send_ip_packet(pkt)
+            elif pkt_dir == PKT_DIR_OUTGOING:
+                self.iface_ext.send_ip_packet(pkt)
+            #check if response is done
+            if "\r\n\r\n" in self.http_connections[(external_ip, dest_port)][2]:
+                self.log_http(external_ip, dest_port)
 
-            if transport_header[4:8] <= curr_seqno:
-                stream += assemble_http(self, pkt, curr_seqno, payload) # add http payload to request / response
-                curr_seqno += len(payload) # increment sequence num
+    def is_syn(self, transport_header):
+        flags = struct.unpack('!B', transport_header[13:14])[0]
+        #00000010
+        print(flags & 0x2 > 0)
+        return flags & 0x2 > 0
+
+
+    def is_ack(self, transport_header):
+        flags = struct.unpack('!B', transport_header[13:14])[0]
+        #00010000
+        print(flags & 0x10 > 0)
+        return flags & 0x10 > 0
+
 
     # 3) Log HTTP        
-    def log_http(self, pkt, external_ip, dest_port):    
+    def log_http(self, external_ip, dest_port):    
         # now, extract relevant data
-        host_name = None
+        request = self.http_connections[(external_ip, dest_port)][0]
+        response = self.http_connections[(external_ip, dest_port)][2]
+        request_lines = request.split('\n')
+        response_lines = response.split('\n')
+
+        contains_host = False
+        for line in range(0, len(request_lines)):
+            if request_lines[line].split()[0].lower() == "host:":
+                host_name = request_lines[line].split()[1].lower()
+                contains_host = True
+        if not contains_host:
+            host_name = external_ip
+        
+        #check if log rule matched
+        curr_match = None
+        for rule in self.rules:
+            if rule[0].lower() == 'log' and self.domain_matches(host_name, rule[2].lower()):
+                curr_match = rule
+        if not curr_match:
+            print('returning')
+            return
+
         method = request.split()[0]
         path = request.split()[1]
         version = request.split()[2]
         status_code = response.split()[1]
-        if "Content-Length" in response:
-            response.find("Content-Length")
-            object_size = #FIX
+        
+        contains_CL = False
+        for line in range(0, len(response_lines)):
+            if response_lines[line].split()[0].lower() == "content-length:":
+                object_size = response_lines[line].split()[1]
+                contains_CL = True
+        if not contains_CL:
+            object_size = -1
+
         bytestream = host_name + " " + method + " " + path + " " + version + " " + status_code + " " + object_size
-        # should i add a '\n', or will ".write()" do it for me?
+        #FLAG should i add a '\n', or will ".write()" do it for me?
 
         # write to log
+        print('writing to log')
         f = open('http.log', a)
-        f.write(bytestream)?? # fix syntax
+        f.write(bytestream) # fix syntax
         f.flush()
 
 
