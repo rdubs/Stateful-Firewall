@@ -287,10 +287,10 @@ class Firewall:
         response_lines = response.split('\r\n')
 
         contains_host = False
-        print("Request lines: ")
-        print(request_lines)
-        #print("Response lines: ")
-        #print(response_lines)
+        # print("Request lines: ")
+        # print(request_lines)
+        # print("Response lines: ")
+        # print(response_lines)
         for line in range(0, len(request_lines)):
             if len(request_lines[line].split()) < 2:
                 continue
@@ -311,13 +311,16 @@ class Firewall:
         method = request.split()[0]
         path = request.split()[1]
         version = request.split()[2]
-        status_code = response.split()[1]
-        
+        # print('response_lines before error: ' + str(response_lines))
+        if len(response_lines[0].split()) >= 2:
+            status_code = response_lines[0].split()[1]
+        else:
+            status_code = ""
         contains_CL = False
         for line in range(0, len(response_lines)):
             if len(response_lines[line].split()) < 2:
                 continue
-            if response_lines[line].split()[0].lower() == "content-length:":
+            if response_lines[line].split()[0].lower() == "content-length:": 
                 object_size = response_lines[line].split()[1]
                 contains_CL = True
         if not contains_CL:
@@ -333,28 +336,6 @@ class Firewall:
         self.http_connections[(external_ip, dest_port)][2] = ''
         return
 
-
-
-
-                
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
->>>>>>> b4f40a2... http logging basic functionality
 
     # TODO: You can add more methods as you want.
     def gen_checksum(self, header):
