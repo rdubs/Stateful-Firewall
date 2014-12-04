@@ -171,11 +171,11 @@ class Firewall:
             udp_len = struct.pack('!H', 8 + dns_header_len)
             udp_checksum = struct.pack('!H', 0)
 
-            udp_pseudo_header = pkt[16:20] + pkt[12:16] + struct.pack('!B', 0) + struct.pack('!B', 17) + struct.pack('!H', 8 + dns_header_len)
-            udp_dummy_header = udp_pseudo_header + source_port + dest_port + udp_len + udp_checksum
-            udp_checksum = self.gen_checksum(udp_dummy_header)
+            # udp_pseudo_header = pkt[16:20] + pkt[12:16] + struct.pack('!B', 0) + struct.pack('!B', 17) + struct.pack('!H', 8 + dns_header_len)
+            # udp_dummy_header = udp_pseudo_header + source_port + dest_port + udp_len + udp_checksum
+            # udp_checksum = self.gen_checksum(udp_dummy_header)
 
-            udp_header = source_port + dest_port + udp_len + struct.pack('!H', udp_checksum)
+            udp_header = source_port + dest_port + udp_len + udp_checksum
 
             dns_response_pkt = ip_header.raw + udp_header + dns_header
 
@@ -194,39 +194,14 @@ class Firewall:
         dest_port = struct.unpack('!H', transport_header[0:2])[0]
         if pkt_dir == PKT_DIR_INCOMING:
             dest_port = struct.unpack('!H', transport_header[2:4])[0]
-        # handle synAck
-        # print(self.http_connections)
-        # print(pkt_dir)
-        # print(str(struct.unpack('!H', transport_header[2:4])[0]))
-        # print(str((external_ip, dest_port)))
-        
         if  (external_ip, dest_port) not in self.http_connections:
             initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
             self.http_connections[(external_ip, dest_port)] = ["", initial_seq_num + 1, "", None]
-            # print('adding entry due to syn bit: ' + str((external_ip, dest_port)))
         elif self.is_syn(transport_header) and self.is_ack(transport_header):
             self.http_connections[(external_ip, dest_port)][3] = struct.unpack('!L', transport_header[4:8])[0] + 1
         #tear down connection on fin ack
         # elif self.is_fin(transport_header) and self.is_ack(transport_header):
         #     del self.http_connections[(external_ip, dest_port)]
-
-
-
-        # if pkt_dir == PKT_DIR_INCOMING:
-        #     dest_port = struct.unpack('!H', transport_header[2:4])[0]
-        #     print(str(dest_port))
-        #     if self.http_connections[(external_ip, dest_port)][3] == None:
-        #         initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
-        #         self.http_connections[(external_ip, dest_port)][2]
-        # print(str((external_ip, dest_port)))
-        # # if this is a new connection
-        # if  pkt_dir == PKT_DIR_OUTGOING and (external_ip, dest_port) not in self.http_connections:
-        #     # initialize empty Request + Response strings
-        #     initial_seq_num = struct.unpack('!L', transport_header[4:8])[0]
-        #     self.http_connections[(external_ip, dest_port)] = ["", initial_seq_num, "", None]
-
-
-        ### initialize Seq #s, based on first pkt // seq # transport_header[4:8]
         
         # map {(external IP, internal port) : ["request", request_seqno, "response", response_seqno]}
 
@@ -234,8 +209,6 @@ class Firewall:
         response = self.http_connections[(external_ip, dest_port)][2]
         # assemble entire request + response
         if "\r\n\r\n" not in request or "\r\n\r\n" not in response:
-            # (fun fact) content length === pkt size - IP - TCP
-            #\r\n\r\n (4bytes) as end of header (only on last pkt of header)
             if pkt_dir == PKT_DIR_OUTGOING : #request
                 stream = 0
                 curr_seqno = 1
@@ -244,14 +217,8 @@ class Firewall:
                 curr_seqno = 3
             packet_seq = struct.unpack('!L', transport_header[4:8])[0]
             if packet_seq > self.http_connections[(external_ip, dest_port)][curr_seqno]:
-                # print('packet_seq ' + str(packet_seq))
-                # print('expected seq: ' + str(self.http_connections[(external_ip, dest_port)][curr_seqno]))
-                # print('returning')
                 return
             elif packet_seq  == self.http_connections[(external_ip, dest_port)][curr_seqno]:
-                # print('seq = expected')
-                # print('adding payload: ' + payload)
-                # print('len of payload: ') + str(len(payload))
                 self.http_connections[(external_ip, dest_port)][stream] += payload # add http payload to request / response
                 self.http_connections[(external_ip, dest_port)][curr_seqno] += len(payload) # increment sequence num
             #send packet through
@@ -287,10 +254,6 @@ class Firewall:
         response_lines = response.split('\r\n')
 
         contains_host = False
-        print("Request lines: ")
-        print(request_lines)
-        #print("Response lines: ")
-        #print(response_lines)
         for line in range(0, len(request_lines)):
             if len(request_lines[line].split()) < 2:
                 continue
@@ -306,7 +269,6 @@ class Firewall:
             if rule[0].lower() == 'log' and self.domain_matches(host_name, rule[2].lower()):
                 curr_match = rule
         if not curr_match:
-            print('returning')
             return
 
         method = request.split()[0]
@@ -333,28 +295,6 @@ class Firewall:
         self.http_connections[(external_ip, dest_port)][0] = ''
         self.http_connections[(external_ip, dest_port)][2] = ''
         return
-
-
-
-
-                
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     # TODO: You can add more methods as you want.
     def gen_checksum(self, header):
@@ -437,20 +377,16 @@ class Firewall:
         length_byte = struct.unpack('!B', qname[0:1])[0]
         curr_byte = 1
         domain_str = ''
-        # print('qname len: ' + str(len(qname)))
         while length_byte != 0:
             for i in range(0, length_byte):
                 bytes_read += qname[curr_byte: (curr_byte + 1)]
                 domain_str += chr(struct.unpack('!B', qname[curr_byte:(curr_byte + 1)])[0])
                 curr_byte += 1
             domain_str += '.'
-            # print(domain_str)
             bytes_read += qname[curr_byte: (curr_byte + 1)]
             length_byte = struct.unpack('!B', qname[curr_byte:(curr_byte + 1)])[0]
             curr_byte += 1
         domain_str = domain_str[0:-1] #get rid of extra '.' at end
-        # print('domain str: ' + domain_str)
-        # print('bytes read: ' + bytes_read + ' vs. allbytes: ' + qname)
         return domain_str, struct.unpack('!H', qname[curr_byte: curr_byte + 2])[0], bytes_read
 
     @staticmethod
